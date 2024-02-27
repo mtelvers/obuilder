@@ -152,10 +152,12 @@ module Make (Raw : S.STORE) = struct
 
   let prune_lru ?(log=ignore) t ~before limit =
     let items = Dao.lru t.dao ~before limit in
+    Log.info (fun f -> f "Dao.ltr returned %d items" (List.length items));
     let items = List.filter (fun id ->
       Builds.filter (fun _ b -> match b.base with
       | Some base -> base = id
       | None -> false) t.in_progress |> Builds.is_empty) items in
+    Log.info (fun f -> f "Filtered out in_progress.  Now %d items" (List.length items));
     match items with
     | [] -> Lwt.return 0
     | id :: _ ->

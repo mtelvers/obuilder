@@ -238,6 +238,7 @@ module Make (Raw_store : S.STORE) (Sandbox : S.SANDBOX) (Fetch : S.FETCHER) = st
         let rootfs = tmp / "rootfs" in
         Os.sudo ["mkdir"; "-m"; "755"; "--"; rootfs] >>= fun () ->
         Fetch.fetch ~log ~rootfs base >>= fun env ->
+        Log.info (fun f -> f "Writing env to %S…" (tmp / "env"));
         Os.write_file ~path:(tmp / "env")
           (Sexplib.Sexp.to_string_hum Saved_context.(sexp_of_t {env})) >>= fun () ->
         Lwt_result.return ()
