@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: btrfs-progs zfs-dkms zfsutils-linux xfsprogs
+          packages: btrfs-progs zfsutils-linux xfsprogs
           version: 2
 
       - name: Checkout code
