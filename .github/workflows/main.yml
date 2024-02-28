@@ -26,7 +26,6 @@ jobs:
     steps:
       # The ppa is needed because of https://www.mail-archive.com/ubuntu-bugs@lists.ubuntu.com/msg5972997.html
       - run: |
-          sudo add-apt-repository ppa:jonathonf/zfs && \
           sudo apt-get --allow-releaseinfo-change update
 
       - uses: awalsh128/cache-apt-pkgs-action@latest
