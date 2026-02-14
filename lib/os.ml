@@ -51,24 +51,125 @@ let close_redirection (x : [`FD_move_safely of unix_fd | `Dev_null]) =
 
 (* stdin, stdout and stderr are copied to the child and then closed on the host.
    They are closed at most once, so duplicates are OK. *)
-let default_exec ?timeout ?cwd ?stdin ?stdout ?stderr ~pp argv =
-  let proc =
-    let stdin  = Option.map redirection stdin in
-    let stdout = Option.map redirection stdout in
-    let stderr = Option.map redirection stderr in
-    try Lwt_result.ok (Lwt_process.exec ?timeout ?cwd ?stdin ?stdout ?stderr argv)
-    with e -> Lwt_result.fail e
+
+(* On Windows, Lwt_process.exec has a bug in lwt 6.1.0 where the promise never
+   resolves even after the child process exits. We use Unix.create_process +
+   Lwt_unix.waitpid as a workaround.
+
+   Note: Unix.create_process doesn't search PATH, so we use cmd.exe /c to
+   invoke the command, which does search PATH. *)
+let win32_exec ?cwd:_ ?stdin ?stdout ?stderr ~pp argv =
+  let dev_null = "NUL" in
+  let get_fd_in = function
+    | Some (`FD_move_safely x) -> x.raw
+    | Some `Dev_null -> Unix.openfile dev_null [Unix.O_RDONLY] 0
+    | None -> Unix.openfile dev_null [Unix.O_RDONLY] 0
   in
-  Option.iter close_redirection stdin;
-  Option.iter close_redirection stdout;
-  Option.iter close_redirection stderr;
-  proc >|= fun proc ->
-  Result.fold ~ok:(function
-      | Unix.WEXITED n -> Ok n
-      | Unix.WSIGNALED x -> Fmt.error_msg "%t failed with signal %a" pp Fmt.Dump.signal x
-      | Unix.WSTOPPED x -> Fmt.error_msg "%t stopped with signal %a" pp Fmt.Dump.signal x)
-    ~error:(fun e ->
-        Fmt.error_msg "%t raised %s\n%s" pp (Printexc.to_string e) (Printexc.get_backtrace ())) proc
+  let get_fd_out = function
+    | Some (`FD_move_safely x) -> x.raw
+    | Some `Dev_null -> Unix.openfile dev_null [Unix.O_WRONLY] 0
+    | None -> Unix.openfile dev_null [Unix.O_WRONLY] 0
+  in
+  let stdin_fd = get_fd_in stdin in
+  let stdout_fd = get_fd_out stdout in
+  let stderr_fd = get_fd_out stderr in
+  Lwt.catch (fun () ->
+    let _cmd, args = argv in
+    (* Use cmd.exe /c to search PATH and handle the command *)
+    let cmd_exe = {|C:\Windows\System32\cmd.exe|} in
+    (* Build command string: cmd.exe /c prog arg1 arg2 ...
+       args[0] is the program, args[1..] are the arguments *)
+    let args_list = Array.to_list args in
+    let cmd_args = Array.of_list ([cmd_exe; "/c"] @ args_list) in
+    let pid = Unix.create_process cmd_exe cmd_args stdin_fd stdout_fd stderr_fd in
+    (* Close fds we opened (dev_null ones) *)
+    Option.iter close_redirection stdin;
+    Option.iter close_redirection stdout;
+    Option.iter close_redirection stderr;
+    Lwt_unix.waitpid [] pid >|= fun (_, status) ->
+    match status with
+    | Unix.WEXITED n -> Ok n
+    | Unix.WSIGNALED x -> Fmt.error_msg "%t failed with signal %a" pp Fmt.Dump.signal x
+    | Unix.WSTOPPED x -> Fmt.error_msg "%t stopped with signal %a" pp Fmt.Dump.signal x
+  ) (fun exn ->
+    Option.iter close_redirection stdin;
+    Option.iter close_redirection stdout;
+    Option.iter close_redirection stderr;
+    Lwt.return (Fmt.error_msg "%t raised %s\n%s" pp (Printexc.to_string exn) (Printexc.get_backtrace ()))
+  )
+
+(* Polling waitpid for processes created directly with Unix.create_process.
+   Lwt_unix.waitpid works for processes created via cmd.exe /c (see win32_exec
+   above) but hangs for directly-created processes on Windows. *)
+let win32_poll_waitpid ?(sleep_interval=0.5) pid =
+  let rec poll () =
+    match Unix.waitpid [Unix.WNOHANG] pid with
+    | (0, _) -> Lwt_unix.sleep sleep_interval >>= poll
+    | (_, status) -> Lwt.return status
+    | exception Unix.Unix_error (Unix.ECHILD, _, _) ->
+      Lwt.return (Unix.WEXITED 0)
+  in
+  poll ()
+
+(* Run a command and capture its stdout+stderr via a temp file.
+   Uses Unix.create_process directly (not cmd.exe /c) with polling waitpid.
+   This is needed for commands like ctr that are called directly on Windows
+   where the pipe-based pread functions do not work reliably. *)
+let win32_pread argv =
+  let pp f = pp_cmd f ("", argv) in
+  let tmpfile = Filename.temp_file "obuilder-win32-" ".out" in
+  let dev_null_in = Unix.openfile "NUL" [Unix.O_RDONLY] 0 in
+  let tmpfd = Unix.openfile tmpfile [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+  Lwt.catch (fun () ->
+    let prog = List.hd argv in
+    let pid = Unix.create_process prog (Array.of_list argv) dev_null_in tmpfd tmpfd in
+    Unix.close dev_null_in;
+    Unix.close tmpfd;
+    win32_poll_waitpid pid >>= fun status ->
+    let output =
+      let ic = open_in_bin tmpfile in
+      Fun.protect ~finally:(fun () -> close_in ic) @@ fun () ->
+      really_input_string ic (in_channel_length ic)
+    in
+    Unix.unlink tmpfile;
+    match status with
+    | Unix.WEXITED 0 -> Lwt_result.return output
+    | Unix.WEXITED n ->
+      Log.warn (fun f -> f "%t failed (exit %d): %s" pp n output);
+      Lwt.return (Fmt.error_msg "%t failed with exit status %d: %s" pp n output)
+    | Unix.WSIGNALED n -> Lwt.return (Fmt.error_msg "%t killed by signal %d" pp n)
+    | Unix.WSTOPPED n -> Lwt.return (Fmt.error_msg "%t stopped by signal %d" pp n)
+  ) (fun exn ->
+    (try Unix.close dev_null_in with _ -> ());
+    (try Unix.close tmpfd with _ -> ());
+    (try Unix.unlink tmpfile with _ -> ());
+    Lwt.return (Fmt.error_msg "%t raised %s" pp (Printexc.to_string exn))
+  )
+
+let default_exec ?timeout ?cwd ?stdin ?stdout ?stderr ~pp argv =
+  if Sys.win32 then
+    (* Use workaround for broken Lwt_process on Windows *)
+    let _ = timeout in (* timeout not supported in workaround *)
+    win32_exec ?cwd ?stdin ?stdout ?stderr ~pp argv
+  else begin
+    let proc =
+      let stdin  = Option.map redirection stdin in
+      let stdout = Option.map redirection stdout in
+      let stderr = Option.map redirection stderr in
+      try Lwt_result.ok (Lwt_process.exec ?timeout ?cwd ?stdin ?stdout ?stderr argv)
+      with e -> Lwt_result.fail e
+    in
+    Option.iter close_redirection stdin;
+    Option.iter close_redirection stdout;
+    Option.iter close_redirection stderr;
+    proc >|= fun proc ->
+    Result.fold ~ok:(function
+        | Unix.WEXITED n -> Ok n
+        | Unix.WSIGNALED x -> Fmt.error_msg "%t failed with signal %a" pp Fmt.Dump.signal x
+        | Unix.WSTOPPED x -> Fmt.error_msg "%t stopped with signal %a" pp Fmt.Dump.signal x)
+      ~error:(fun e ->
+          Fmt.error_msg "%t raised %s\n%s" pp (Printexc.to_string e) (Printexc.get_backtrace ())) proc
+  end
 
 (* Similar to default_exec except using open_process_none in order to get the
    pid of the forked process. On macOS this allows for cleaner job cancellations *)
@@ -127,7 +228,19 @@ let sudo_result ?cwd ?stdin ?stdout ?stderr ?is_success ~pp args =
 let rec write_all fd buf ofs len =
   assert (len >= 0);
   if len = 0 then Lwt.return_unit
-  else (
+  else if Sys.win32 then begin
+    (* On Windows, Lwt_unix.write hangs. Use synchronous write instead. *)
+    let unix_fd = Lwt_unix.unix_file_descr fd in
+    let rec sync_write ofs len =
+      if len = 0 then ()
+      else begin
+        let n = Unix.write unix_fd buf ofs len in
+        sync_write (ofs + n) (len - n)
+      end
+    in
+    sync_write ofs len;
+    Lwt.return_unit
+  end else (
     Lwt_unix.write fd buf ofs len >>= fun n ->
     write_all fd buf (ofs + n) (len - n)
   )
@@ -141,9 +254,17 @@ let rec write_all_string fd buf ofs len =
   )
 
 let write_file ~path contents =
-  let flags = [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC; Unix.O_NONBLOCK; Unix.O_CLOEXEC] in
-  Lwt_io.(with_file ~mode:output ~flags) path @@ fun ch ->
-  Lwt_io.write ch contents
+  if Sys.win32 then begin
+    (* Use synchronous write on Windows to avoid Lwt_io issues *)
+    let oc = open_out path in
+    Fun.protect ~finally:(fun () -> flush oc; close_out oc) @@ fun () ->
+    output_string oc contents;
+    Lwt.return_unit
+  end else begin
+    let flags = [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC; Unix.O_NONBLOCK; Unix.O_CLOEXEC] in
+    Lwt_io.(with_file ~mode:output ~flags) path @@ fun ch ->
+    Lwt_io.write ch contents
+  end
 
 let with_pipe_from_child fn =
   let r, w = Lwt_unix.pipe_in ~cloexec:true () in
@@ -231,30 +352,61 @@ let read_link x =
 
 let rm ~directory =
   let pp _ ppf = Fmt.pf ppf "[ RM ]" in
-  sudo_result ~pp:(pp "RM") ["rm"; "-r"; directory ] >>= fun t ->
-  match t with
-  | Ok () -> Lwt.return_unit
-  | Error (`Msg m) ->
-    Log.warn (fun f -> f "Failed to remove %s because %s" directory m);
-    Lwt.return_unit
+  if Sys.win32 then begin
+    (* Use rmdir /s /q on Windows *)
+    exec_result ~pp:(pp "RM") ["rmdir"; "/s"; "/q"; directory ] >>= fun t ->
+    match t with
+    | Ok () -> Lwt.return_unit
+    | Error (`Msg m) ->
+      Log.warn (fun f -> f "Failed to remove %s because %s" directory m);
+      Lwt.return_unit
+  end else begin
+    sudo_result ~pp:(pp "RM") ["rm"; "-r"; directory ] >>= fun t ->
+    match t with
+    | Ok () -> Lwt.return_unit
+    | Error (`Msg m) ->
+      Log.warn (fun f -> f "Failed to remove %s because %s" directory m);
+      Lwt.return_unit
+  end
 
 let mv ~src dst =
   let pp _ ppf = Fmt.pf ppf "[ MV ]" in
-  sudo_result ~pp:(pp "MV") ["mv"; src; dst ] >>= fun t ->
-  match t with
-  | Ok () -> Lwt.return_unit
-  | Error (`Msg m) ->
-    Log.warn (fun f -> f "Failed to move %s to %s because %s" src dst m);
-    Lwt.return_unit
+  if Sys.win32 then begin
+    (* Use synchronous rename on Windows *)
+    Lwt.catch (fun () ->
+      Sys.rename src dst;
+      Lwt.return_unit
+    ) (fun exn ->
+      Log.warn (fun f -> f "Failed to move %s to %s because %s" src dst (Printexc.to_string exn));
+      Lwt.return_unit
+    )
+  end else begin
+    sudo_result ~pp:(pp "MV") ["mv"; src; dst ] >>= fun t ->
+    match t with
+    | Ok () -> Lwt.return_unit
+    | Error (`Msg m) ->
+      Log.warn (fun f -> f "Failed to move %s to %s because %s" src dst m);
+      Lwt.return_unit
+  end
 
 let cp ~src dst =
   let pp _ ppf = Fmt.pf ppf "[ CP ]" in
-  sudo_result ~pp:(pp "CP") ["cp"; "-pRduT"; "--reflink=auto"; src; dst ] >>= fun t ->
-  match t with
-  | Ok () -> Lwt.return_unit
-  | Error (`Msg m) ->
-    Log.warn (fun f -> f "Failed to copy from %s to %s because %s" src dst m);
-    Lwt.return_unit
+  if Sys.win32 then
+    exec_result ~pp:(pp "CP") ["robocopy"; src; dst; "/E"; "/NFL"; "/NDL"; "/NJH"; "/NJS"]
+      ~is_success:(fun n -> n < 8)  (* robocopy exit codes < 8 are success *)
+    >>= fun t ->
+    match t with
+    | Ok () -> Lwt.return_unit
+    | Error (`Msg m) ->
+      Log.warn (fun f -> f "Failed to copy from %s to %s because %s" src dst m);
+      Lwt.return_unit
+  else
+    sudo_result ~pp:(pp "CP") ["cp"; "-pRduT"; "--reflink=auto"; src; dst ] >>= fun t ->
+    match t with
+    | Ok () -> Lwt.return_unit
+    | Error (`Msg m) ->
+      Log.warn (fun f -> f "Failed to copy from %s to %s because %s" src dst m);
+      Lwt.return_unit
 
 let normalise_path root_dir =
   if Sys.win32 then
