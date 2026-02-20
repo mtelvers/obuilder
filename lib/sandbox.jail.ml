@@ -1,9 +1,14 @@
-open Lwt.Infix
 open Sexplib.Conv
 
 let ( / ) = Filename.concat
 
+(* Check if a switch has been cancelled *)
+let switch_is_cancelled _sw =
+  try Eio.Fiber.check (); false
+  with Eio.Cancel.Cancelled _ -> true
+
 type t = {
+  proc_mgr : [`Generic] Eio.Process.mgr_ty Eio.Resource.t option;
   jail_name_prefix : string;
 }
 
@@ -82,18 +87,18 @@ let jail_options config rootdir tmp_dir =
 let copy_to_log ~src ~dst =
   let buf = Bytes.create 4096 in
   let rec aux () =
-    Lwt_unix.read src buf 0 (Bytes.length buf) >>= function
-    | 0 -> Lwt.return_unit
-    | n -> Build_log.write dst (Bytes.sub_string buf 0 n) >>= aux
+    match Unix.read src buf 0 (Bytes.length buf) with
+    | 0 -> ()
+    | n -> Build_log.write dst (Bytes.sub_string buf 0 n); aux ()
   in
   aux ()
 
 let jail_id = ref 0
 
-let run ~cancelled ?stdin:stdin ~log (t : t) config rootdir =
-  Lwt_io.with_temp_dir ~prefix:"obuilder-jail-" @@ fun tmp_dir ->
+let run ~sw ?stdin:stdin ~log (t : t) config rootdir =
+  Os.with_temp_dir ~prefix:"obuilder-jail-" @@ fun tmp_dir ->
   let zfs_volume = String.sub rootdir 1 (String.length rootdir - 1) in  (* remove / from front *)
-  Os.sudo [ "zfs"; "inherit"; "mountpoint"; zfs_volume ^ "/rootfs" ] >>= fun () ->
+  Os.sudo [ "zfs"; "inherit"; "mountpoint"; zfs_volume ^ "/rootfs" ];
   let cwd = rootdir in
   let jail_name = t.jail_name_prefix ^ "_" ^ string_of_int !jail_id in
   incr jail_id;
@@ -103,70 +108,62 @@ let run ~cancelled ?stdin:stdin ~log (t : t) config rootdir =
   (* Make sure the work directory exists prior to starting the jail. *)
   begin
     match Os.check_dir workdir with
-    | `Present -> Lwt.return_unit
+    | `Present -> ()
     | `Missing -> Os.sudo [ "mkdir" ; "-p" ; workdir ]
-  end >>= fun () ->
+  end;
   let stdout = `FD_move_safely out_w in
   let stderr = stdout in
-  let copy_log = copy_to_log ~src:out_r ~dst:log in
-  let proc =
-    let cmd =
-      let options = jail_options config rootdir tmp_dir in
-      "jail" :: "-c" :: ("name=" ^ jail_name) :: options
-    in
-    let stdin = Option.map (fun x -> `FD_move_safely x) stdin in
-    let pp f = Os.pp_cmd f ("", cmd) in
-    (* This is similar to
-       Os.sudo_result ~cwd ?stdin ~stdout ~stderr ~pp cmd
-       but also unmounting the in-jail devfs if necessary, see below. *)
-    let cmd = if Os.running_as_root then cmd else "sudo" :: "--" :: cmd in
-    Logs.info (fun f -> f "Exec %a" Os.pp_cmd ("", cmd));
-    !Os.lwt_process_exec ~cwd ?stdin ~stdout ~stderr ~pp
-      ("", Array.of_list cmd) >>= function
-    | Ok 0 ->
-      let fstab = tmp_dir / "fstab" in
-      (if Sys.file_exists fstab
-      then
-        let cmd = [ "sudo" ; "/sbin/umount" ; "-a" ; "-F" ; fstab ] in
-        Os.exec ~is_success:(fun _ -> true) cmd
-      else Lwt.return_unit) >>= fun () ->
-      (* If the command within the jail completes, the jail is automatically
-         removed, but without performing any of the stop and release actions,
-         thus we can not use "exec.stop" to unmount the in-jail devfs
-         filesystem. Do this here, ignoring the exit code of umount(8). *)
-      let cmd = [ "sudo" ; "/sbin/umount" ; rootdir / "dev" ] in
-      Os.exec ~is_success:(fun _ -> true) cmd >>= fun () ->
-      Lwt_result.ok Lwt.return_unit
-    | Ok n -> Lwt.return @@ Fmt.error_msg "%t failed with exit status %d" pp n
-    | Error e -> Lwt_result.fail e
-  in
-  Lwt.on_termination cancelled (fun () ->
-    let rec aux () =
-      if Lwt.is_sleeping proc then (
-         let pp f = Fmt.pf f "jail -r obuilder" in
-         Os.sudo_result ~cwd [ "jail" ; "-r" ; jail_name ] ~pp >>= function
-         | Ok () -> Lwt.return_unit
-         | Error (`Msg _) ->
-           Lwt_unix.sleep 10.0 >>= aux
-      ) else Lwt.return_unit (* Process has already finished *)
-    in
-    Lwt.async aux
-  );
-  proc >>= fun r ->
-  copy_log >>= fun () ->
-  if Lwt.is_sleeping cancelled then
-    Lwt.return (r :> (unit, [`Msg of string | `Cancelled]) result)
+  let result = ref (Error (`Msg "Process not started")) in
+  let cancelled = switch_is_cancelled sw in
+  Eio.Fiber.both
+    (fun () -> copy_to_log ~src:out_r ~dst:log)
+    (fun () ->
+       let cmd =
+         let options = jail_options config rootdir tmp_dir in
+         "jail" :: "-c" :: ("name=" ^ jail_name) :: options
+       in
+       let stdin = Option.map (fun x -> `FD_move_safely x) stdin in
+       let pp f = Os.pp_cmd f ("", cmd) in
+       (* This is similar to
+          Os.sudo_result ~cwd ?stdin ~stdout ~stderr ~pp cmd
+          but also unmounting the in-jail devfs if necessary, see below. *)
+       let cmd = if Os.running_as_root then cmd else "sudo" :: "--" :: cmd in
+       Logs.info (fun f -> f "Exec %a" Os.pp_cmd ("", cmd));
+       begin match Os.process_exec ?proc_mgr:t.proc_mgr ~cwd ?stdin ~stdout ~stderr ~pp
+               ("", Array.of_list cmd) with
+       | Ok 0 ->
+         let fstab = tmp_dir / "fstab" in
+         (if Sys.file_exists fstab
+          then begin
+            let cmd = [ "sudo" ; "/sbin/umount" ; "-a" ; "-F" ; fstab ] in
+            Os.exec ~is_success:(fun _ -> true) cmd
+          end);
+         (* If the command within the jail completes, the jail is automatically
+            removed, but without performing any of the stop and release actions,
+            thus we can not use "exec.stop" to unmount the in-jail devfs
+            filesystem. Do this here, ignoring the exit code of umount(8). *)
+         let cmd = [ "sudo" ; "/sbin/umount" ; rootdir / "dev" ] in
+         Os.exec ~is_success:(fun _ -> true) cmd;
+         result := Ok ()
+       | Ok n ->
+         result := Fmt.error_msg "%t failed with exit status %d" pp n
+       | Error e ->
+         result := Error e
+       end;
+       Os.ensure_closed_unix out_w);
+  if cancelled then
+    Error `Cancelled
   else
-    Lwt_result.fail `Cancelled
+    (!result :> (unit, [`Msg of string | `Cancelled]) result)
 
-let create ~state_dir:_ _c =
-  Lwt.return {
+let create ?proc_mgr ~state_dir:_ _c =
+  {
+    proc_mgr;
     (* Compute a unique (across obuilder instances) name prefix for the jail. *)
     jail_name_prefix = "obuilder_" ^ (Int.to_string (Unix.getpid ()));
   }
 
-let finished () =
-  Lwt.return ()
+let finished () = ()
 
 let shell _ = None
 

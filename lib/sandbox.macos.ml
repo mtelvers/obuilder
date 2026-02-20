@@ -1,12 +1,16 @@
-open Lwt.Infix
 open Cmdliner
+
+(* Check if a switch has been cancelled *)
+let switch_is_cancelled _sw =
+  try Eio.Fiber.check (); false
+  with Eio.Cancel.Cancelled _ -> true
 
 type t = {
   uid: int;
   gid: int;
   (* mount point where Homebrew is installed. Either /opt/homebrew or /usr/local depending upon architecture *)
   brew_path : string;
-  lock : Lwt_mutex.t;
+  lock : Eio.Mutex.t;
 }
 
 open Sexplib.Conv
@@ -29,9 +33,9 @@ let run_as ~env ~user ~cmd =
 let copy_to_log ~src ~dst =
   let buf = Bytes.create 4096 in
   let rec aux () =
-    Lwt_unix.read src buf 0 (Bytes.length buf) >>= function
-    | 0 -> Lwt.return_unit
-    | n -> Build_log.write dst (Bytes.sub_string buf 0 n) >>= aux
+    match Unix.read src buf 0 (Bytes.length buf) with
+    | 0 -> ()
+    | n -> Build_log.write dst (Bytes.sub_string buf 0 n); aux ()
   in
   aux ()
 
@@ -44,8 +48,8 @@ let zfs_volume_from path =
   |> List.tl
   |> String.concat "/"
 
-let run ~cancelled ?stdin:stdin ~log (t : t) config result_tmp =
-  Lwt_mutex.with_lock t.lock (fun () ->
+let run ~sw ?stdin:stdin ~log (t : t) config result_tmp =
+  Eio.Mutex.use_rw ~protect:false t.lock @@ fun () ->
   Log.info (fun f -> f "result_tmp = %s" result_tmp);
   Os.with_pipe_from_child @@ fun ~r:out_r ~w:out_w ->
   let user = user_name ~prefix:"mac" ~uid:t.uid in
@@ -53,66 +57,53 @@ let run ~cancelled ?stdin:stdin ~log (t : t) config result_tmp =
   let home_dir = Filename.concat "/Users/" user in
   let zfs_home_dir = Filename.concat zfs_volume "home" in
   let zfs_brew = Filename.concat zfs_volume "brew" in
-  Os.sudo [ "zfs"; "set"; "mountpoint=" ^ home_dir; zfs_home_dir ] >>= fun () ->
-  Os.sudo [ "zfs"; "set"; "mountpoint=" ^ t.brew_path; zfs_brew ] >>= fun () ->
-  Lwt_list.iter_s (fun { Config.Mount.src; dst; readonly; _ } ->
+  Os.sudo [ "zfs"; "set"; "mountpoint=" ^ home_dir; zfs_home_dir ];
+  Os.sudo [ "zfs"; "set"; "mountpoint=" ^ t.brew_path; zfs_brew ];
+  List.iter (fun { Config.Mount.src; dst; readonly; _ } ->
     Log.info (fun f -> f "src = %s, dst = %s, type %s" src dst (if readonly then "ro" else "rw") );
     if Sys.file_exists dst then
-      Os.sudo [ "zfs"; "set"; "mountpoint=" ^ dst; zfs_volume_from src ]
-    else Lwt.return_unit) config.Config.mounts >>= fun () ->
+      Os.sudo [ "zfs"; "set"; "mountpoint=" ^ dst; zfs_volume_from src ]) config.Config.mounts;
   let uid = string_of_int t.uid in
   let gid = string_of_int t.gid in
-  Macos.create_new_user ~username:user ~home_dir ~uid ~gid >>= fun _ ->
+  let _ = Macos.create_new_user ~username:user ~home_dir ~uid ~gid in
   let osenv = config.Config.env in
   let stdout = `FD_move_safely out_w in
   let stderr = stdout in
-  let copy_log = copy_to_log ~src:out_r ~dst:log in
-  let proc_id = ref None in
-  let proc =
-    let stdin = Option.map (fun x -> `FD_move_safely x) stdin in
-    let pp f = Os.pp_cmd f ("", config.Config.argv) in
-    Os.pread @@ Macos.get_tmpdir ~user >>= fun tmpdir ->
-    let tmpdir = List.hd (String.split_on_char '\n' tmpdir) in
-    let env = ("TMPDIR", tmpdir) :: osenv in
-    let cmd = run_as ~env ~user ~cmd:config.Config.argv in
-    Os.ensure_dir config.Config.cwd;
-    let pid, proc = Os.open_process ?stdin ~stdout ~stderr ~pp ~cwd:config.Config.cwd cmd in
-    proc_id := Some pid;
-    Os.process_result ~pp proc >>= fun r ->
-    Lwt.return r
-  in
-  Lwt.on_termination cancelled (fun () ->
-    let aux () =
-      if Lwt.is_sleeping proc then
-        match !proc_id with
-          | Some _ -> Macos.kill_users_processes ~uid:t.uid
-          | None -> Log.warn (fun f -> f "Failed to find pid…"); Lwt.return ()
-      else Lwt.return_unit (* Process has already finished *)
-    in
-    Lwt.async aux
-  );
-  proc >>= fun r ->
-  copy_log >>= fun () ->
-    Lwt_list.iter_s (fun { Config.Mount.src; dst = _; readonly = _; ty = _ } ->
-      Os.sudo [ "zfs"; "inherit"; "mountpoint"; zfs_volume_from src ]) config.Config.mounts >>= fun () ->
-    Macos.sudo_fallback [ "zfs"; "set"; "mountpoint=none"; zfs_home_dir ] [ "zfs"; "unmount"; "-f"; zfs_home_dir ] ~uid:t.uid >>= fun () ->
-    Macos.sudo_fallback [ "zfs"; "set"; "mountpoint=none"; zfs_brew ] [ "zfs"; "unmount"; "-f"; zfs_brew ] ~uid:t.uid >>= fun () ->
-    if Lwt.is_sleeping cancelled then
-      Lwt.return (r :> (unit, [`Msg of string | `Cancelled]) result)
-    else Lwt_result.fail `Cancelled)
+  let result = ref (Error (`Msg "Process not started")) in
+  let cancelled = Eio.Switch.is_cancelled sw in
+  Eio.Fiber.both
+    (fun () -> copy_to_log ~src:out_r ~dst:log)
+    (fun () ->
+       let stdin = Option.map (fun x -> `FD_move_safely x) stdin in
+       let pp f = Os.pp_cmd f ("", config.Config.argv) in
+       let tmpdir = Os.pread @@ Macos.get_tmpdir ~user in
+       let tmpdir = List.hd (String.split_on_char '\n' tmpdir) in
+       let env = ("TMPDIR", tmpdir) :: osenv in
+       let cmd = run_as ~env ~user ~cmd:config.Config.argv in
+       Os.ensure_dir config.Config.cwd;
+       let _pid, proc = Os.open_process ?stdin ~stdout ~stderr ~pp ~cwd:config.Config.cwd cmd in
+       result := Os.process_result ~pp proc;
+       Os.ensure_closed_unix out_w);
+  List.iter (fun { Config.Mount.src; dst = _; readonly = _; ty = _ } ->
+    Os.sudo [ "zfs"; "inherit"; "mountpoint"; zfs_volume_from src ]) config.Config.mounts;
+  Macos.sudo_fallback [ "zfs"; "set"; "mountpoint=none"; zfs_home_dir ] [ "zfs"; "unmount"; "-f"; zfs_home_dir ] ~uid:t.uid;
+  Macos.sudo_fallback [ "zfs"; "set"; "mountpoint=none"; zfs_brew ] [ "zfs"; "unmount"; "-f"; zfs_brew ] ~uid:t.uid;
+  if cancelled then
+    Error `Cancelled
+  else
+    (!result :> (unit, [`Msg of string | `Cancelled]) result)
 
-let create ~state_dir:_ c =
-  Lwt.return {
+let create ?proc_mgr:_ ~state_dir:_ c =
+  {
     uid = c.uid;
     gid = 1000;
     brew_path = c.brew_path;
-    lock = Lwt_mutex.create ();
+    lock = Eio.Mutex.create ();
   }
 
 let finished () =
-  Os.sudo [ "zfs"; "unmount"; "obuilder/result" ] >>= fun () ->
-  Os.sudo [ "zfs"; "mount"; "obuilder/result" ] >>= fun () ->
-  Lwt.return ()
+  Os.sudo [ "zfs"; "unmount"; "obuilder/result" ];
+  Os.sudo [ "zfs"; "mount"; "obuilder/result" ]
 
 let shell _ = None
 

@@ -1,5 +1,3 @@
-open Lwt.Syntax
-
 type ids = [
   | `Docker_image of string | `Docker_container of string
   | `Docker_volume of string | `Obuilder_id of string
@@ -50,9 +48,9 @@ let rec setup_command ~entp ~cmd =
 
 let extract_name = function `Docker_image name | `Docker_container name | `Docker_volume name -> name
 
-let pread ?timeout ?stderr argv =
+let pread ?stderr argv =
   let stderr = Option.value ~default:(`FD_move_safely Os.stderr) stderr in
-  Os.pread ?timeout  ~stderr ("docker" :: argv)
+  Os.pread ~stderr ("docker" :: argv)
 
 let pread_result ?stdin ?stderr argv =
   let cmd = "docker" :: argv in
@@ -102,8 +100,8 @@ module Cmd = struct
 
   let commit ?stdout ?stderr (`Docker_image base_image) (`Docker_container container) (`Docker_image target_image) =
     (* Restore CMD and ENTRYPOINT *)
-    let* entrypoint = pread ["inspect"; "--type=image"; "--format={{json .Config.Entrypoint }}"; "--"; base_image] in
-    let* cmd = pread ["inspect"; "--type=image"; "--format={{json .Config.Cmd }}"; "--"; base_image] in
+    let entrypoint = pread ["inspect"; "--type=image"; "--format={{json .Config.Entrypoint }}"; "--"; base_image] in
+    let cmd = pread ["inspect"; "--type=image"; "--format={{json .Config.Cmd }}"; "--"; base_image] in
     let entrypoint, cmd = String.trim entrypoint, String.trim cmd in
     let argv = [ "--"; container; target_image ] in
     let argv = if entrypoint = "null" then argv else ("--change=ENTRYPOINT " ^ entrypoint) :: argv in
@@ -152,9 +150,9 @@ module Cmd = struct
   let stop ?stdout ?stderr (`Docker_container name) =
     exec_result' ?stdout ?stderr ["stop"; name]
 
-  let volume ?stderr ?timeout = function
+  let volume ?stderr = function
     | `Create (`Docker_volume name) ->
-      pread ?timeout ("volume" :: "create" :: "--" :: name :: [])
+      pread ("volume" :: "create" :: "--" :: name :: [])
     | `Inspect (volumes, `Mountpoint) ->
       let volumes = List.rev_map extract_name volumes in
       let format = "{{ .Mountpoint }}" in
@@ -167,13 +165,13 @@ module Cmd = struct
       pread ("volume" :: "rm" :: "--" :: volumes)
 
   let volume_containers ?stderr (`Docker_volume name) =
-    let+ names = pread ?stderr (["ps"; "-a"; "--filter"; "volume=" ^ name; "--format={{ .Names }}"]) in
+    let names = pread ?stderr (["ps"; "-a"; "--filter"; "volume=" ^ name; "--format={{ .Names }}"]) in
     names |> String.trim |> String.split_on_char '\n'
     |> List.map (fun id -> `Docker_container id)
 
   let mount_point ?stderr name =
-    let* s = volume ?stderr (`Inspect ([name], `Mountpoint)) in
-    Lwt.return (String.trim s)
+    let s = volume ?stderr (`Inspect ([name], `Mountpoint)) in
+    String.trim s
 
   let rmi ?stdout ?stderr images =
     exec' ?stdout ?stderr ("rmi" :: (List.rev_map extract_name images))
@@ -187,22 +185,19 @@ module Cmd = struct
       exec_result' ?stdout ?stderr ("manifest" :: "rm" :: (List.rev_map extract_name manifests))
 
   let obuilder_images ?stderr ?tmp () =
-    let* images = pread ?stderr ["images"; "--format={{ .Repository }}"; image_name ?tmp "*"] in
+    let images = pread ?stderr ["images"; "--format={{ .Repository }}"; image_name ?tmp "*"] in
     String.split_on_char '\n' images
     |> List.filter_map (function "" -> None | id -> Some (`Docker_image id))
-    |> Lwt.return
 
   let obuilder_containers ?stderr () =
-    let* containers = pread ?stderr ["container"; "ls"; "--all"; "--filter"; "name=^" ^ !prefix; "-q"] in
+    let containers = pread ?stderr ["container"; "ls"; "--all"; "--filter"; "name=^" ^ !prefix; "-q"] in
     String.split_on_char '\n' containers
     |> List.filter_map (function "" -> None | id -> Some (`Docker_container id))
-    |> Lwt.return
 
   let obuilder_volumes ?stderr ?(prefix=(!prefix)) () =
-    let* volumes = volume ?stderr (`List (Some ("name=^" ^ prefix))) in
+    let volumes = volume ?stderr (`List (Some ("name=^" ^ prefix))) in
     String.split_on_char '\n' volumes
     |> List.filter_map (function "" -> None | id -> Some (`Docker_volume id))
-    |> Lwt.return
 
   let obuilder_caches_tmp ?stderr () =
     obuilder_volumes ?stderr ~prefix:(cache_prefix () ^ "tmp-") ()
@@ -217,18 +212,16 @@ module Cmd_log = struct
   let with_stderr_log ~log fn =
     Os.with_pipe_from_child @@ fun ~r:err_r ~w:err_w ->
     let stderr = `FD_move_safely err_w in
-    let copy_log = Build_log.copy ~src:err_r ~dst:log in
-    let* r = fn ~stderr in
-    let+ () = copy_log in
+    let r = fn ~stderr in
+    Build_log.copy ~src:err_r ~dst:log;
     r
 
   let with_log ~log fn =
     Os.with_pipe_from_child @@ fun ~r:out_r ~w:out_w ->
     let stdout = `FD_move_safely out_w in
     let stderr = stdout in
-    let copy_log = Build_log.copy ~src:out_r ~dst:log in
-    let* r = fn ~stdout ~stderr in
-    let+ () = copy_log in
+    let r = fn ~stdout ~stderr in
+    Build_log.copy ~src:out_r ~dst:log;
     r
 
   let version ~log () =
@@ -256,8 +249,8 @@ module Cmd_log = struct
     with_log ~log (fun ~stdout ~stderr ->
         Cmd.commit ~stdout ~stderr base_image container target_image)
 
-  let volume ~log ?timeout cmd =
-    with_stderr_log ~log (fun ~stderr -> Cmd.volume ~stderr ?timeout cmd)
+  let volume ~log cmd =
+    with_stderr_log ~log (fun ~stderr -> Cmd.volume ~stderr cmd)
 
   let volume_containers ~log volume =
     with_stderr_log ~log (fun ~stderr -> Cmd.volume_containers ~stderr volume)
@@ -334,27 +327,26 @@ let cp_between_volumes ~base ~src ~dst =
   Os.with_pipe_between_children @@ fun ~r ~w ->
   let proc = Cmd.run_result' ~stdin:(`FD_move_safely r) ~rm:true mounts_proc base [tar; "-xp"; "-C"; root ^ "dst"; "-f"; "-"]
   and send = Cmd.run_result' ~stdout:(`FD_move_safely w) ~rm:true mounts_send base [tar; "-c"; "-C"; root ^ "src"; "-f"; "-"; "."] in
-  let open Lwt_result.Syntax in
-  let* () = proc in
-  let+ () = send in
-  ()
+  match proc, send with
+  | Ok (), Ok () -> Ok ()
+  | Error _ as e, _ -> e
+  | _, (Error _ as e) -> e
 
 let with_container ~log base fn =
-  let* cid = Os.with_pipe_from_child (fun ~r ~w ->
+  let cid = Os.with_pipe_from_child (fun ~r ~w ->
       (* We might need to do a pull here, so log the output to show progress. *)
-      let copy = Build_log.copy ~src:r ~dst:log in
-      let* cid = Cmd.create ~stderr:(`FD_move_safely w) (`Docker_image base) in
-      let+ () = copy in
+      let cid = Cmd.create ~stderr:(`FD_move_safely w) (`Docker_image base) in
+      Build_log.copy ~src:r ~dst:log;
       String.trim cid
     )
   in
-  Lwt.finalize
+  Fun.protect
     (fun () -> fn cid)
-    (fun () -> Cmd.rm ~stdout:`Dev_null [`Docker_container cid])
+    ~finally:(fun () -> Cmd.rm ~stdout:`Dev_null [`Docker_container cid])
 
 module Extract = struct
-  let export_env base : Config.env Lwt.t =
-    let+ env =
+  let export_env base : Config.env =
+    let env =
       pread ["image"; "inspect";
               "--format"; {|{{range .Config.Env}}{{print . "\x00"}}{{end}}|};
               "--"; base] in
@@ -368,13 +360,10 @@ module Extract = struct
       )
 
   let fetch ~log ~root:_ ~rootfs base =
-    let* () = with_container ~log base (fun cid ->
+    with_container ~log base (fun cid ->
         Os.with_pipe_between_children @@ fun ~r ~w ->
-        let exporter = Cmd.export ~stdout:(`FD_move_safely w) (`Docker_container cid) in
-        let tar = Os.sudo ~stdin:(`FD_move_safely r) ["tar"; "-C"; rootfs; "-xf"; "-"] in
-        let* () = exporter in
-        tar
-      )
-    in
+        Cmd.export ~stdout:(`FD_move_safely w) (`Docker_container cid);
+        Os.sudo ~stdin:(`FD_move_safely r) ["tar"; "-C"; rootfs; "-xf"; "-"]
+      );
     export_env base
 end

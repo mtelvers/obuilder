@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 let strf = Printf.sprintf
 
 let running_as_root = Unix.getuid () = 0
@@ -11,11 +9,12 @@ let running_as_root = Unix.getuid () = 0
    since being cloned. The counter starts from zero when the in-memory cache
    value is created (i.e. you cannot compare across restarts). *)
 type cache = {
-  lock : Lwt_mutex.t;
+  lock : Eio.Mutex.t;
   mutable gen : int;
 }
 
 type t = {
+  proc_mgr : [`Generic] Eio.Process.mgr_ty Eio.Resource.t option;
   root : string;        (* The top-level directory (containing `result`, etc). *)
   caches : (string, cache) Hashtbl.t;
   mutable next : int;   (* Used to generate unique temporary IDs. *)
@@ -24,35 +23,35 @@ type t = {
 let ( / ) = Filename.concat
 
 module Btrfs = struct
-  let btrfs ?(sudo=false) args =
+  let btrfs ?proc_mgr ?(sudo=false) args =
     let args = "btrfs" :: args in
     let args = if sudo && not running_as_root then "sudo" :: args else args in
-    Os.exec ~stdout:`Dev_null args
+    Os.exec ?proc_mgr ~stdout:`Dev_null args
 
-  let subvolume_create path =
+  let subvolume_create ?proc_mgr path =
     assert (not (Sys.file_exists path));
-    btrfs ["subvolume"; "create"; "--"; path]
+    btrfs ?proc_mgr ["subvolume"; "create"; "--"; path]
 
-  let subvolume_delete path =
-    btrfs ~sudo:true ["subvolume"; "delete"; "--"; path]
+  let subvolume_delete ?proc_mgr path =
+    btrfs ?proc_mgr ~sudo:true ["subvolume"; "delete"; "--"; path]
 
-  let subvolume_sync path =
-    btrfs ~sudo:true ["subvolume"; "sync"; "--"; path]
+  let subvolume_sync ?proc_mgr path =
+    btrfs ?proc_mgr ~sudo:true ["subvolume"; "sync"; "--"; path]
 
-  let subvolume_snapshot mode ~src dst =
+  let subvolume_snapshot ?proc_mgr mode ~src dst =
     assert (not (Sys.file_exists dst));
     let readonly =
       match mode with
       | `RO -> ["-r"]
       | `RW -> []
     in
-    btrfs ~sudo:true (["subvolume"; "snapshot"] @ readonly @ ["--"; src; dst])
+    btrfs ?proc_mgr ~sudo:true (["subvolume"; "snapshot"] @ readonly @ ["--"; src; dst])
 end
 
-let delete_snapshot_if_exists path =
+let delete_snapshot_if_exists ?proc_mgr path =
   match Os.check_dir path with
-  | `Missing -> Lwt.return_unit
-  | `Present -> Btrfs.subvolume_delete path
+  | `Missing -> ()
+  | `Present -> Btrfs.subvolume_delete ?proc_mgr path
 
 module Path = struct
   (* A btrfs store contains several subdirectories:
@@ -73,95 +72,90 @@ module Path = struct
 end
 
 let delete t id =
-  delete_snapshot_if_exists (Path.result t id)
+  delete_snapshot_if_exists ?proc_mgr:t.proc_mgr (Path.result t id)
 
-let purge path =
-  Sys.readdir path |> Array.to_list |> Lwt_list.iter_s (fun item ->
+let purge ?proc_mgr path =
+  Sys.readdir path |> Array.iter (fun item ->
       let item = path / item in
       Log.warn (fun f -> f "Removing left-over temporary item %S" item);
-      Btrfs.subvolume_delete item
+      Btrfs.subvolume_delete ?proc_mgr item
     )
 
-let check_kernel_version () =
-  Os.pread ["uname"; "-r"] >>= fun kver ->
+let check_kernel_version ?proc_mgr () =
+  let kver = Os.pread ?proc_mgr ["uname"; "-r"] in
   match String.split_on_char '.' kver with
   | maj :: min :: _ ->
-      begin match int_of_string_opt maj, int_of_string_opt min with
+    begin match int_of_string_opt maj, int_of_string_opt min with
       | Some maj, Some min when (maj, min) >= (5, 8) ->
-          Lwt.return_unit
+        ()
       | Some maj, Some min ->
-          Fmt.failwith "You need at least linux 5.8 to use the btrfs backend, \
-                        but current kernel version is '%d.%d'" maj min
+        Fmt.failwith "You need at least linux 5.8 to use the btrfs backend, \
+                      but current kernel version is '%d.%d'" maj min
       | _, _ ->
-          Fmt.failwith "Could not parse kernel version %S" kver
-      end
+        Fmt.failwith "Could not parse kernel version %S" kver
+    end
   | _ ->
-      Fmt.failwith "Could not parse output of 'uname -r' (%S)" kver
+    Fmt.failwith "Could not parse output of 'uname -r' (%S)" kver
 
 let root t = t.root
 
 module Stats = Map.Make (String)
 
 let df t =
-  Lwt_process.pread ("", [| "btrfs"; "filesystem"; "usage"; "-b"; t.root |]) >>= fun output ->
+  let output = Os.pread ?proc_mgr:t.proc_mgr ["btrfs"; "filesystem"; "usage"; "-b"; t.root] in
   let stats =
     String.split_on_char '\n' output
     |> List.filter_map (fun s ->
-           match String.split_on_char ':' s with
-           | a :: b :: _ -> (
-               match Scanf.sscanf b " %Ld " (fun x -> x) with
-               | x -> Some (String.trim a, Int64.to_float x)
-               | (exception Scanf.Scan_failure _) | (exception End_of_file) ->
-                   None)
-           | _ -> None)
+        match String.split_on_char ':' s with
+        | a :: b :: _ -> (
+            match Scanf.sscanf b " %Ld " (fun x -> x) with
+            | x -> Some (String.trim a, Int64.to_float x)
+            | (exception Scanf.Scan_failure _) | (exception End_of_file) ->
+              None)
+        | _ -> None)
     |> List.fold_left (fun acc (k, v) -> Stats.add k v acc) Stats.empty
   in
-  Lwt.return (100. -. (100. *. (Stats.find "Used" stats /. Stats.find "Device size" stats)))
+  100. -. (100. *. (Stats.find "Used" stats /. Stats.find "Device size" stats))
 
-let create root =
-  check_kernel_version () >>= fun () ->
+let create ?proc_mgr root =
+  check_kernel_version ?proc_mgr ();
   Os.ensure_dir (root / "result");
   Os.ensure_dir (root / "result-tmp");
   Os.ensure_dir (root / "state");
   Os.ensure_dir (root / "cache");
   Os.ensure_dir (root / "cache-tmp");
-  purge (root / "result-tmp") >>= fun () ->
-  purge (root / "cache-tmp") >>= fun () ->
-  Lwt.return { root; caches = Hashtbl.create 10; next = 0 }
+  purge ?proc_mgr (root / "result-tmp");
+  purge ?proc_mgr (root / "cache-tmp");
+  { proc_mgr; root; caches = Hashtbl.create 10; next = 0 }
 
 let build t ?base ~id fn =
   let result = Path.result t id in
   let result_tmp = Path.result_tmp t id in
   assert (not (Sys.file_exists result));        (* Builder should have checked first *)
-  begin match base with
-    | None -> Btrfs.subvolume_create result_tmp
-    | Some base -> Btrfs.subvolume_snapshot `RW ~src:(Path.result t base) result_tmp
-  end
-  >>= fun () ->
-  Lwt.try_bind
-    (fun () -> fn result_tmp)
-    (fun r ->
-       begin match r with
-         | Ok () -> Btrfs.subvolume_snapshot `RO ~src:result_tmp result
-         | Error _ -> Lwt.return_unit
-       end >>= fun () ->
-       Btrfs.subvolume_delete result_tmp >>= fun () ->
-       Lwt.return r
-    )
-  (fun ex ->
-      Log.warn (fun f -> f "Uncaught exception from %S build function: %a" id Fmt.exn ex);
-      Btrfs.subvolume_delete result_tmp >>= fun () ->
-      Lwt.reraise ex
-  )
+  (match base with
+   | None -> Btrfs.subvolume_create ?proc_mgr:t.proc_mgr result_tmp
+   | Some base -> Btrfs.subvolume_snapshot ?proc_mgr:t.proc_mgr `RW ~src:(Path.result t base) result_tmp);
+  match fn result_tmp with
+  | Ok () as r ->
+    Btrfs.subvolume_snapshot ?proc_mgr:t.proc_mgr `RO ~src:result_tmp result;
+    Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr result_tmp;
+    r
+  | Error _ as r ->
+    Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr result_tmp;
+    r
+  | exception ex ->
+    Log.warn (fun f -> f "Uncaught exception from %S build function: %a" id Fmt.exn ex);
+    Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr result_tmp;
+    raise ex
 
 let result t id =
   let dir = Path.result t id in
   match Os.check_dir dir with
-  | `Present -> Lwt.return_some dir
-  | `Missing -> Lwt.return_none
+  | `Present -> Some dir
+  | `Missing -> None
 
 let log_file t id =
-  result t id >|= function
+  match result t id with
   | Some dir -> dir / "log"
   | None -> (Path.result_tmp t id) / "log"
 
@@ -169,55 +163,51 @@ let get_cache t name =
   match Hashtbl.find_opt t.caches name with
   | Some c -> c
   | None ->
-    let c = { lock = Lwt_mutex.create (); gen = 0 } in
+    let c = { lock = Eio.Mutex.create (); gen = 0 } in
     Hashtbl.add t.caches name c;
     c
 
-let cache ~user t name : (string * (unit -> unit Lwt.t)) Lwt.t =
+let cache ~user t name : (string * (unit -> unit)) =
   let cache = get_cache t name in
-  Lwt_mutex.with_lock cache.lock @@ fun () ->
+  Eio.Mutex.use_rw ~protect:true cache.lock @@ fun () ->
   let tmp = Path.cache_tmp t t.next name in
   t.next <- t.next + 1;
   let snapshot = Path.cache t name in
   (* Create cache if it doesn't already exist. *)
-  begin match Os.check_dir snapshot with
-    | `Missing -> Btrfs.subvolume_create snapshot
-    | `Present -> Lwt.return_unit
-  end >>= fun () ->
+  (match Os.check_dir snapshot with
+   | `Missing -> Btrfs.subvolume_create ?proc_mgr:t.proc_mgr snapshot
+   | `Present -> ());
   (* Create writeable clone. *)
   let gen = cache.gen in
-  Btrfs.subvolume_snapshot `RW ~src:snapshot tmp >>= fun () ->
-  begin match user with
-    | `Unix { Obuilder_spec.uid; gid } ->
-      Os.sudo ["chown"; Printf.sprintf "%d:%d" uid gid; tmp]
-    | `Windows _ -> assert false (* btrfs not supported on Windows*)
-  end >>= fun () ->
+  Btrfs.subvolume_snapshot ?proc_mgr:t.proc_mgr `RW ~src:snapshot tmp;
+  (match user with
+   | `Unix { Obuilder_spec.uid; gid } ->
+     Os.sudo ?proc_mgr:t.proc_mgr ["chown"; Printf.sprintf "%d:%d" uid gid; tmp]
+   | `Windows _ -> assert false (* btrfs not supported on Windows*));
   let release () =
-    Lwt_mutex.with_lock cache.lock @@ fun () ->
-    begin
-      if cache.gen = gen then (
-        (* The cache hasn't changed since we cloned it. Update it. *)
-        (* todo: check if it has actually changed. *)
-        cache.gen <- cache.gen + 1;
-        Btrfs.subvolume_delete snapshot >>= fun () ->
-        Btrfs.subvolume_snapshot `RO ~src:tmp snapshot
-      ) else Lwt.return_unit
-    end >>= fun () ->
-    Btrfs.subvolume_delete tmp
+    Eio.Mutex.use_rw ~protect:true cache.lock @@ fun () ->
+    if cache.gen = gen then (
+      (* The cache hasn't changed since we cloned it. Update it. *)
+      (* todo: check if it has actually changed. *)
+      cache.gen <- cache.gen + 1;
+      Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr snapshot;
+      Btrfs.subvolume_snapshot ?proc_mgr:t.proc_mgr `RO ~src:tmp snapshot
+    );
+    Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr tmp
   in
-  Lwt.return (tmp, release)
+  (tmp, release)
 
 let delete_cache t name =
   let cache = get_cache t name in
-  Lwt_mutex.with_lock cache.lock @@ fun () ->
+  Eio.Mutex.use_rw ~protect:true cache.lock @@ fun () ->
   cache.gen <- cache.gen + 1;   (* Ensures in-progress writes will be discarded *)
   let snapshot = Path.cache t name in
   if Sys.file_exists snapshot then (
-    Btrfs.subvolume_delete snapshot >>= fun () ->
-    Lwt_result.return ()
-  ) else Lwt_result.return ()
+    Btrfs.subvolume_delete ?proc_mgr:t.proc_mgr snapshot;
+    Ok ()
+  ) else Ok ()
 
 let state_dir = Path.state
 
 let complete_deletes t =
-  Btrfs.subvolume_sync t.root
+  Btrfs.subvolume_sync ?proc_mgr:t.proc_mgr t.root

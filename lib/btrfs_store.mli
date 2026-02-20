@@ -2,5 +2,5 @@
 
 include S.STORE
 
-val create : string -> t Lwt.t
-(** [create path] is a new store in btrfs directory [path]. *)
+val create : ?proc_mgr:[`Generic] Eio.Process.mgr_ty Eio.Resource.t -> string -> t
+(** [create ?proc_mgr path] is a new store in btrfs directory [path]. *)

@@ -1,14 +1,11 @@
-open Lwt.Infix
-
 let ( / ) = Filename.concat
-let ( >>!= ) = Lwt_result.bind
 
 module Make (Raw : S.STORE) = struct
   type build = {
     mutable users : int;
-    set_cancelled : unit Lwt.u;         (* Resolve this to cancel (when [users = 0]). *)
-    log : Build_log.t Lwt.t;
-    result : (([`Loaded | `Saved] * S.id), [`Cancelled | `Msg of string]) Lwt_result.t;
+    cancelled : unit Eio.Promise.t * unit Eio.Promise.u;  (* Resolve this to cancel (when [users = 0]). *)
+    log : (Build_log.t, exn) result Eio.Promise.t * (Build_log.t, exn) result Eio.Promise.u;
+    result : (([`Loaded | `Saved] * S.id), [`Cancelled | `Msg of string]) result Eio.Promise.t * (([`Loaded | `Saved] * S.id), [`Cancelled | `Msg of string]) result Eio.Promise.u;
     base : string option;
   }
 
@@ -19,28 +16,29 @@ module Make (Raw : S.STORE) = struct
     dao : Dao.t;
     (* Invariants for builds in [in_progress]:
        - [result] is still pending and [log] isn't finished.
-       - [set_cancelled] is resolved iff [users = 0]. *)
+       - [cancelled] is resolved iff [users = 0]. *)
     mutable in_progress : build Builds.t;
     mutable cache_hit : int;
     mutable cache_miss : int;
   }
 
-  let finish_log ~set_log log =
-    match Lwt.state log with
-    | Lwt.Return log ->
+  let finish_log ~set_log (log_promise, _) =
+    match Eio.Promise.peek log_promise with
+    | Some (Ok log) ->
       Build_log.finish log
-    | Lwt.Fail _ ->
-      Lwt.return_unit
-    | Lwt.Sleep ->
-      Lwt.wakeup_exn set_log (Failure "Build ended without setting a log!");
-      Lwt.return_unit
+    | Some (Error _) ->
+      () (* Already failed *)
+    | None ->
+      Eio.Promise.resolve set_log (Error (Failure "Build ended without setting a log!"))
 
   let dec_ref build =
     build.users <- build.users - 1;
-    if Lwt.is_sleeping build.result then (
+    let result_promise, _ = build.result in
+    if Option.is_none (Eio.Promise.peek result_promise) then (
       Log.info (fun f -> f "User cancelled job (users now = %d)" build.users);
       if build.users = 0 then (
-        Lwt.wakeup_later build.set_cancelled ()
+        let _, set_cancelled = build.cancelled in
+        Eio.Promise.resolve set_cancelled ()
       )
     )
 
@@ -48,31 +46,32 @@ module Make (Raw : S.STORE) = struct
      or by doing a new build using [fn]. We only run one instance of this
      at a time for a single [id]. *)
   let get_build t ~base ~id ~cancelled ~set_log fn =
-    Raw.result t.raw id >>= function
+    match Raw.result t.raw id with
     | Some _ ->
       t.cache_hit <- t.cache_hit + 1;
       let now = Unix.(gmtime (gettimeofday ())) in
       Dao.set_used t.dao ~id ~now;
-      Raw.log_file t.raw id >>= fun log_file ->
-      begin
+      let log_file = Raw.log_file t.raw id in
+      let log =
         if Sys.file_exists log_file then Build_log.of_saved log_file
-        else Lwt.return Build_log.empty
-      end >>= fun log ->
-      Lwt.wakeup set_log log;
-      Lwt_result.return (`Loaded, id)
+        else Build_log.empty
+      in
+      Eio.Promise.resolve set_log (Ok log);
+      Ok (`Loaded, id)
     | None ->
       t.cache_miss <- t.cache_miss + 1;
-      Raw.build t.raw ?base ~id (fun dir ->
-          Raw.log_file t.raw id >>= fun log_file ->
+      match Raw.build t.raw ?base ~id (fun dir ->
+          let log_file = Raw.log_file t.raw id in
           if Sys.file_exists log_file then Unix.unlink log_file;
-          Build_log.create log_file >>= fun log ->
-          Lwt.wakeup set_log log;
+          let log = Build_log.create log_file in
+          Eio.Promise.resolve set_log (Ok log);
           fn ~cancelled ~log dir
-        )
-      >>!= fun () ->
-      let now = Unix.(gmtime (gettimeofday () )) in
-      Dao.add t.dao ?parent:base ~id ~now;
-      Lwt_result.return (`Saved, id)
+        ) with
+      | Ok () ->
+        let now = Unix.(gmtime (gettimeofday () )) in
+        Dao.add t.dao ?parent:base ~id ~now;
+        Ok (`Saved, id)
+      | Error e -> Error e
 
   let log_ty client_log ~id = function
     | `Loaded -> client_log `Note (Fmt.str "---> using %S from cache" id)
@@ -84,50 +83,75 @@ module Make (Raw : S.STORE) = struct
      [get_build] should set the log being used as soon as it knows it
      (this can't happen until we've created the temporary directory
      in the underlying store). *)
-  let rec build ?switch t ?base ~id ~log:client_log fn =
+  let rec build ?sw t ?base ~id ~log:client_log fn =
     match Builds.find_opt id t.in_progress with
     | Some existing when existing.users = 0 ->
       client_log `Note ("Waiting for previous build to finish cancelling");
-      assert (Lwt.is_sleeping existing.result);
-      existing.result >>= fun _ ->
-      build ?switch t ?base ~id ~log:client_log fn
+      let result_promise, _ = existing.result in
+      assert (Option.is_none (Eio.Promise.peek result_promise));
+      let _ = Eio.Promise.await result_promise in
+      build ?sw t ?base ~id ~log:client_log fn
     | Some existing ->
       (* We're already building this, and the build hasn't been cancelled. *)
       existing.users <- existing.users + 1;
-      existing.log >>= fun log ->
-      Lwt_switch.add_hook_or_exec switch (fun () -> dec_ref existing; Lwt.return_unit) >>= fun () ->
-      Build_log.tail ?switch log (client_log `Output) >>!= fun () ->
-      existing.result >>!= fun (ty, r) ->
-      log_ty client_log ~id ty;
-      Lwt_result.return r
+      let log_promise, _ = existing.log in
+      let log_result = Eio.Promise.await log_promise in
+      (match sw with
+       | Some sw -> Eio.Switch.on_release sw (fun () -> dec_ref existing)
+       | None -> ());
+      begin match log_result with
+       | Error _ -> Error (`Msg "Log creation failed")
+       | Ok log ->
+         begin match Build_log.tail ?sw log (client_log `Output) with
+         | Ok () ->
+           let result_promise, _ = existing.result in
+           (match Eio.Promise.await result_promise with
+            | Ok (ty, r) ->
+              log_ty client_log ~id ty;
+              Ok r
+            | Error e -> Error e)
+         | Error `Cancelled -> Error `Cancelled
+         end
+      end
     | None ->
-      let result, set_result = Lwt.wait () in
-      let log, set_log = Lwt.wait () in
-      let tail_log = log >>= fun log -> Build_log.tail ?switch log (client_log `Output) in
-      let cancelled, set_cancelled = Lwt.wait () in
-      let build = { users = 1; set_cancelled; log; result; base } in
-      Lwt_switch.add_hook_or_exec switch (fun () -> dec_ref build; Lwt.return_unit) >>= fun () ->
+      let result = Eio.Promise.create () in
+      let log = Eio.Promise.create () in
+      let cancelled = Eio.Promise.create () in
+      let build = { users = 1; cancelled; log; result; base } in
+      (match sw with
+       | Some sw -> Eio.Switch.on_release sw (fun () -> dec_ref build)
+       | None -> ());
       t.in_progress <- Builds.add id build t.in_progress;
-      Lwt.async
-        (fun () ->
-           Lwt.try_bind
-             (fun () -> get_build t ~base ~id ~cancelled ~set_log fn)
-             (fun r ->
-                t.in_progress <- Builds.remove id t.in_progress;
-                Lwt.wakeup_later set_result r;
-                finish_log ~set_log log
-             )
-             (fun ex ->
-                Log.info (fun f -> f "Build %S error: %a" id Fmt.exn ex);
-                t.in_progress <- Builds.remove id t.in_progress;
-                Lwt.wakeup_later_exn set_result ex;
-                finish_log ~set_log log
-             )
-        );
-      tail_log >>!= fun () ->
-      result >>!= fun (ty, r) ->
-      log_ty client_log ~id ty;
-      Lwt_result.return r
+      let log_promise, set_log = log in
+      let _, set_result = result in
+      (* Start the build in a fiber *)
+      let cancelled_promise, _ = cancelled in
+      (try
+         let r = get_build t ~base ~id ~cancelled:cancelled_promise ~set_log fn in
+         t.in_progress <- Builds.remove id t.in_progress;
+         Eio.Promise.resolve set_result r;
+         finish_log ~set_log log
+       with ex ->
+         Log.info (fun f -> f "Build %S error: %a" id Fmt.exn ex);
+         t.in_progress <- Builds.remove id t.in_progress;
+         Eio.Promise.resolve set_result (Error (`Msg (Printexc.to_string ex)));
+         finish_log ~set_log log);
+      (* Tail the log *)
+      let log_result = Eio.Promise.await log_promise in
+      begin match log_result with
+      | Error _ -> Error (`Msg "Log creation failed")
+      | Ok log ->
+        begin match Build_log.tail ?sw log (client_log `Output) with
+        | Ok () ->
+          let result_promise, _ = result in
+          (match Eio.Promise.await result_promise with
+           | Ok (ty, r) ->
+             log_ty client_log ~id ty;
+             Ok r
+           | Error e -> Error e)
+        | Error `Cancelled -> Error `Cancelled
+        end
+      end
 
   let result t id = Raw.result t.raw id
   let count t = Dao.count t.dao
@@ -144,9 +168,9 @@ module Make (Raw : S.STORE) = struct
         Log.warn (fun f -> f "ID %S not in database!" id);
         Raw.delete t.raw id     (* Try removing it anyway *)
       | Ok deps ->
-        Lwt_list.iter_s aux deps >>= fun () ->
+        List.iter aux deps;
         log id;
-        Raw.delete t.raw id >|= fun () ->
+        Raw.delete t.raw id;
         Dao.delete t.dao id
     in
     aux id
@@ -158,27 +182,27 @@ module Make (Raw : S.STORE) = struct
       | Some base -> base = id
       | None -> false) t.in_progress |> Builds.is_empty) items in
     match items with
-    | [] -> Lwt.return 0
+    | [] -> 0
     | id :: _ ->
       log id;
-      Raw.delete t.raw id >>= fun () ->
-      Dao.delete t.dao id ;
-      Lwt.return 1
+      Raw.delete t.raw id;
+      Dao.delete t.dao id;
+      1
 
   let prune ?log t ~before limit =
     Log.info (fun f -> f "Pruning %d items" limit);
     let rec aux count =
-      if count >= limit then Lwt.return count  (* Pruned everything we wanted to *)
+      if count >= limit then count  (* Pruned everything we wanted to *)
       else (
-        prune_lru ?log t ~before limit >>= function
-        | 0 -> Lwt.return count           (* Nothing left to prune *)
+        match prune_lru ?log t ~before limit with
+        | 0 -> count           (* Nothing left to prune *)
         | n -> aux (count + n)
       )
     in
-    aux 0 >>= fun n ->
-    Raw.complete_deletes t.raw >>= fun () ->
+    let n = aux 0 in
+    Raw.complete_deletes t.raw;
     Log.info (fun f -> f "Pruned %d items" n);
-    Lwt.return n
+    n
 
   let wrap raw =
     let db_dir = Raw.state_dir raw / "db" in

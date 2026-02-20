@@ -1,5 +1,3 @@
-open Lwt.Infix
-
 module Os = Obuilder.Os
 
 let ( / ) = Filename.concat
@@ -8,29 +6,42 @@ let strf = Printf.sprintf
 
 let unix_path path =
   if Sys.win32 then
-    Lwt_process.pread ("", [| "cygpath"; "-u"; path|]) >|= fun str -> String.trim str
+    let buf = Buffer.create 256 in
+    let ic = Unix.open_process_in (Printf.sprintf "cygpath -u %S" path) in
+    let line = input_line ic in
+    ignore (Unix.close_process_in ic);
+    String.trim line
   else
-    Lwt.return path
+    path
 
 let next_container_id = ref 0
 
 let base_tar =
   let mydir = Sys.getcwd () in
-  Lwt_main.run begin
-    let base_tar = mydir / "base.tar" in
-    Lwt_io.(with_file ~mode:input) base_tar Lwt_io.read
-  end
-  |> Bytes.of_string
+  let base_tar = mydir / "base.tar" in
+  let ic = open_in_bin base_tar in
+  let len = in_channel_length ic in
+  let data = really_input_string ic len in
+  close_in ic;
+  Bytes.of_string data
 
 let with_fd x f =
   match x with
   | `FD_move_safely fd ->
     let copy = Unix.dup ~cloexec:true fd.Os.raw in
     Os.close fd;
-    Lwt.finalize
-      (fun () -> f copy)
-      (fun () -> Unix.close copy; Lwt.return_unit)
+    Fun.protect ~finally:(fun () -> Unix.close copy) @@ fun () ->
+    f copy
   | _ -> failwith "Unsupported mock FD redirection"
+
+let write_all fd buf ofs len =
+  let rec aux ofs remaining =
+    if remaining = 0 then ()
+    else
+      let n = Unix.write fd buf ofs remaining in
+      aux (ofs + n) (remaining - n)
+  in
+  aux ofs len
 
 let docker_create ?stdout base =
   with_fd (Option.get stdout) @@ fun stdout ->
@@ -38,7 +49,7 @@ let docker_create ?stdout base =
   incr next_container_id;
   let rec aux i =
     let len = String.length id - i in
-    if len = 0 then Lwt_result.return 0
+    if len = 0 then Ok 0
     else (
       let sent = Unix.single_write_substring stdout id i len in
       aux (i + sent)
@@ -48,37 +59,32 @@ let docker_create ?stdout base =
 
 let docker_export ?stdout _id =
   with_fd (Option.get stdout) @@ fun stdout ->
-  let stdout = Lwt_unix.of_unix_file_descr stdout in
-  Os.write_all stdout base_tar 0 (Bytes.length base_tar) >|= fun () ->
+  write_all stdout base_tar 0 (Bytes.length base_tar);
   Ok 0
 
 let docker_inspect ?stdout _id =
   with_fd (Option.get stdout) @@ fun stdout ->
-  let stdout = Lwt_unix.of_unix_file_descr stdout in
   let msg = Bytes.of_string "PATH=/usr/bin:/usr/local/bin" in
-  Os.write_all stdout msg 0 (Bytes.length msg) >|= fun () ->
+  write_all stdout msg 0 (Bytes.length msg);
   Ok 0
 
 let exec_docker ?stdout = function
   | ["create"; "--"; base] -> docker_create ?stdout base
   | ["export"; "--"; id] -> docker_export ?stdout id
   | ["image"; "inspect"; "--format"; {|{{range .Config.Env}}{{print . "\x00"}}{{end}}|}; "--"; base] -> docker_inspect ?stdout base
-  | ["rm"; "--force"; "--"; id] -> Fmt.pr "docker rm --force %S@." id; Lwt_result.return 0
+  | ["rm"; "--force"; "--"; id] -> Fmt.pr "docker rm --force %S@." id; Ok 0
   | x -> Fmt.failwith "Unknown mock docker command %a" Fmt.(Dump.list string) x
 
 let mkdir = function
-  | ["-m"; "755"; "--"; path] -> Unix.mkdir path 0o755; Lwt_result.return 0
+  | ["-m"; "755"; "--"; path] -> Unix.mkdir path 0o755; Ok 0
   | x -> Fmt.failwith "Unexpected mkdir %a" Fmt.(Dump.list string) x
 
 let closing redir fn =
-  Lwt.finalize fn
-    (fun () ->
-       begin match redir with
-         | Some (`FD_move_safely fd) -> Os.ensure_closed_unix fd
-         | _ -> ()
-       end;
-       Lwt.return_unit
-    )
+  Fun.protect fn ~finally:(fun () ->
+    match redir with
+    | Some (`FD_move_safely fd) -> Os.ensure_closed_unix fd
+    | _ -> ()
+  )
 
 let exec ?timeout ?cwd ?stdin ?stdout ?stderr ~pp cmd =
   ignore timeout;
@@ -93,7 +99,7 @@ let exec ?timeout ?cwd ?stdin ?stdout ?stderr ~pp cmd =
       | "sudo" :: "--" :: ("tar" :: _ as tar) when not Os.running_as_root ->
         Os.default_exec ?cwd ?stdin ?stdout ~pp ("", Array.of_list tar)
       | "tar" :: "-C" :: path :: opts when Os.running_as_root ->
-        unix_path path >>= fun path ->
+        let path = unix_path path in
         let tar = (if Sys.win32 then "C:\\cygwin64\\bin\\tar.exe" else "tar") :: "-C" :: path :: opts in
         Os.default_exec ?cwd ?stdin ?stdout ~pp ("", Array.of_list tar)
       | "mkdir" :: args when Os.running_as_root -> mkdir args
