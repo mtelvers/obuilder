@@ -58,13 +58,13 @@ let delete t id =
   let path = Path.result t id in
   match Os.check_dir path with
   | `Missing -> ()
-  | `Present -> Os.rm ?proc_mgr:None ~directory:path
+  | `Present -> Os.rm ?proc_mgr:None ~directory:path ()
 
 let purge path =
   Sys.readdir path |> Array.iter (fun item ->
       let item = path / item in
       Log.warn (fun f -> f "Removing left-over temporary item %S" item);
-      Os.rm ?proc_mgr:None ~directory:item
+      Os.rm ?proc_mgr:None ~directory:item ()
     )
 
 let root t = t.root
@@ -96,11 +96,11 @@ let build t ?base ~id fn =
     Os.mv ~src:result_tmp result;
     r
   | Error _ as r ->
-    Os.rm ?proc_mgr:None ~directory:result_tmp;
+    Os.rm ?proc_mgr:None ~directory:result_tmp ();
     r
   | exception ex ->
     Log.warn (fun f -> f "Uncaught exception from %S build function: %a" id Fmt.exn ex);
-    Os.rm ?proc_mgr:None ~directory:result_tmp;
+    Os.rm ?proc_mgr:None ~directory:result_tmp ();
     raise ex
 
 let result t id =
@@ -142,7 +142,7 @@ let cache ~user:_ t name =
     let tmp_stat = Unix.stat (Path.image tmp) in
     if tmp_stat.st_size > cache_stat.st_size then
       Os.cp ?proc_mgr:None ~src:tmp master;
-    Os.rm ?proc_mgr:None ~directory:tmp
+    Os.rm ?proc_mgr:None ~directory:tmp ()
   in
   (tmp, release)
 
@@ -154,7 +154,7 @@ let delete_cache t name =
   else
     let snapshot = Path.cache t name in
     if Sys.file_exists snapshot then begin
-      Os.rm ?proc_mgr:None ~directory:snapshot;
+      Os.rm ?proc_mgr:None ~directory:snapshot ();
       Ok ()
     end else Ok ()
 

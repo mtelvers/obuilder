@@ -257,7 +257,7 @@ let read_link x =
   | s -> Some s
   | exception Unix.Unix_error(Unix.ENOENT, _, _) -> None
 
-let rm ?proc_mgr ~directory =
+let rm ?proc_mgr ~directory () =
   let pp _ ppf = Fmt.pf ppf "[ RM ]" in
   match sudo_result ?proc_mgr ~pp:(pp "RM") ["rm"; "-r"; directory ] with
   | Ok () -> ()
