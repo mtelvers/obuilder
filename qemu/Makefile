@@ -112,7 +112,7 @@ openbsd-80-amd64-ocaml-4.14.qcow2: openbsd-80-amd64-ocaml-4.14.4.qcow2
 	ln -sf $< $@
 
 openbsd-80-amd64-ocaml-%.qcow2: tftp/auto_install tftp/bsd.rd tftp/etc/boot.conf mirror%
-	qemu-img create -f qcow2 $@ 24G
+	qemu-img create -f qcow2 $@ 32G
 	qemu-img create -f qcow2 cache-ffs.qcow2 20G
 	python3 -m http.server --directory mirror --bind 0.0.0.0 80 & pid=$$! && \
 	qemu-system-x86_64 -m 16G -smp 8 -machine accel=kvm,type=pc -cpu host -display none -vnc :0 \
